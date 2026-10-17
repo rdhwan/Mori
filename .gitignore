@@ -11,3 +11,6 @@ __pycache__/
 .claude/
 skills-lock.json
 data/
+logs/
+*.log
+botting/.stop/
