@@ -326,13 +326,13 @@ Enable or disable automatic reconnection after a disconnect.
 ```
 
 #### `disconnect`
-Disconnect the bot from the current server. If auto-reconnect is enabled, the bot will reconnect automatically.
+Disconnect the bot from the current server. Manual disconnects stay offline until `reconnect` — `auto_reconnect` only applies to unexpected server disconnects.
 ```json
 { "type": "disconnect" }
 ```
 
 #### `reconnect`
-Force a reconnect. If the bot is currently connected, it disconnects first and reconnects via the normal disconnect handler. If already disconnected, reconnects immediately.
+Force a reconnect. Clears any manual-disconnect latch. If the bot is currently connected, it disconnects first and reconnects via the normal disconnect handler. If already disconnected, reconnects immediately.
 ```json
 { "type": "reconnect" }
 ```
@@ -883,6 +883,7 @@ Fired when any delay value is changed — via the HTTP `set_delays` command or v
 | `connecting` | Initial state, attempting to connect |
 | `connected` | Connected to game server |
 | `in_game` | In-game — world select screen or inside a world |
+| `disconnected` | Manually disconnected — stays offline until reconnect |
 | `two_factor_auth` | Blocked by 2FA — retries after `twofa_secs` |
 | `server_overloaded` | Server overloaded — retries after `server_overload_secs` |
 | `too_many_logins` | Too many concurrent logins — retries after `too_many_logins_secs` |
@@ -903,3 +904,53 @@ All `x`/`y` values are in **tile coordinates** (pixels ÷ 32). The bot's positio
 | `server_overload_secs` | 30s | Reconnect wait after server overload |
 | `too_many_logins_secs` | 5s | Reconnect wait after too-many-logins rejection |
 | `maintenance_secs` | 600s | Reconnect wait after server maintenance rejection |
+
+---
+
+## gRPC API
+
+> Public docs (no login): pretty HTML at `/docs/grpc`, raw agent-friendly markdown at `/docs/grpc/index.md` (+ one file per group), proto at `/docs/mori.proto`.
+
+External control plane for other languages (Python, Go, Node, …), mirroring the Lua API (`LUA.md`). Runs alongside the web UI.
+
+**Endpoint**: `localhost:50051` (override with `MORI_GRPC_ADDR`, e.g. `127.0.0.1:50051`)
+**Schema**: `proto/mori.proto` (service `mori.v1.Mori`)
+
+### Auth (from env)
+
+If `MORI_GRPC_TOKEN` is set, every RPC must carry `authorization: Bearer <token>` metadata, else `UNAUTHENTICATED`. If unset, the server starts unauthenticated (warning logged).
+
+```bash
+MORI_GRPC_TOKEN=secret ./target/release/Mori
+```
+
+### Python example
+
+```bash
+pip install grpcio grpcio-tools
+python -m grpc_tools.protoc -I proto --python_out=examples --grpc_python_out=examples proto/mori.proto
+MORI_GRPC_TOKEN=secret python examples/python_grpc_bot.py
+```
+
+See `examples/python_grpc_bot.py` for spawn/query/action/event-streaming usage.
+
+### RPC groups
+
+| Group | RPCs |
+|-------|------|
+| Manager | `SpawnBot`, `SpawnLtokenBot`, `StopBot`, `ListBots`, `GetBotState`, `GetConfig` |
+| World actions | `Say`, `Warp`, `LeaveWorld`, `Respawn`, `Active`, `Enter`, `AcceptAccess` |
+| Tile / inventory | `Place`, `Hit`, `Wrench`, `WrenchPlayer`, `Wear`, `Unwear`, `Drop`, `Trash`, `FastDrop`, `FastTrash`, `Buy` |
+| Movement | `MoveRelative`, `MoveTo`, `WalkTo`, `SetDirection`, `FindPath` |
+| Collection | `Collect`, `CollectObject` (fire-and-forget; count not returned) |
+| Connection / raw | `Reconnect`, `Disconnect`, `SendPacket`, `SendRaw`, `SetMac` |
+| Settings | `SetAutoCollect`, `SetIgnoreGems`, `SetIgnoreEssences`, `SetAutoLeaveOnMod`, `SetAutoBan`, `SetCollectPathCheck`, `SetAutoReconnect`, `SetCollectInterval`, `SetCollectRange`, `SetReconnectInterval`, `SetPlaceDelay`, `SetWalkDelay`, `SetDelays`, `SetCollectConfig` |
+| Scripts | `RunScript`, `StopScript` (same embedded Lua runner) |
+| Queries | `GetWorld`, `GetInventory`, `GetPlayers`, `GetPlayer`, `GetTile`, `GetObject`, `GetItemInfo`, `ListItems`, `GetLocal`, `GetPing`, `IsInWorld`, `IsInTile` |
+| Events | `SubscribeEvents` (server-streaming; replaces Lua `listenEvents`) |
+
+Notes:
+
+* `place`/`hit`/`wrench`/`active` `x`/`y` are offsets from the bot's tile, like Lua.
+* Reads come from the shared `BotState` snapshot; writes go through the `BotCommand` queue. Unknown `bot_id` → `NOT_FOUND`.
+* `GetWorld` returns full tile lists — poll `GetTile`/`GetObject` for hot loops instead.

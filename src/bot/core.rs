@@ -163,6 +163,9 @@ pub struct Bot {
     pub auto_ban: bool,
     /// Whether the bot should automatically reconnect after a disconnect.
     pub auto_reconnect: bool,
+    /// Set by an explicit user `disconnect` (control plane / Lua) — stays
+    /// offline until an explicit `reconnect`. Server kicks still auto-reconnect.
+    manual_disconnect: bool,
     /// Delay in ms before reconnecting after a disconnect (default 0).
     pub reconnect_interval: u64,
     /// Auto-collect range in tiles (1–5); pixel radius is `tiles × 32`.
@@ -300,6 +303,7 @@ impl Bot {
             auto_leave_on_mod: false,
             auto_ban: false,
             auto_reconnect: true,
+            manual_disconnect: false,
             reconnect_interval: 0,
             collect_radius_tiles: 3,
             collect_blacklist: HashSet::new(),
@@ -464,6 +468,7 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
             auto_leave_on_mod: false,
             auto_ban: false,
             auto_reconnect: true,
+            manual_disconnect: false,
             reconnect_interval: 0,
             collect_radius_tiles: 3,
             collect_blacklist: HashSet::new(),
@@ -711,7 +716,12 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             if let Some(at) = self.reconnect_after {
                 if std::time::Instant::now() >= at {
                     self.reconnect_after = None;
-                    if self.auto_reconnect {
+                    if self.manual_disconnect {
+                        self.log_console(
+                            "[Bot] Reconnect timer elapsed — staying offline (manual disconnect)"
+                                .to_string(),
+                        );
+                    } else if self.auto_reconnect {
                         self.log_console(
                             "[Bot] 2FA cooldown elapsed — re-fetching token and server data"
                                 .to_string(),
@@ -771,20 +781,34 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                     self.log_console(format!("[Bot] Disconnected: peer {}", id.0));
                     {
                         let mut s = self.state.write().unwrap();
-                        s.status = BotStatus::Connecting;
                         s.world_name = String::new();
                         s.players = Vec::new();
                         s.ping_ms = 0;
+                        if self.manual_disconnect {
+                            s.status = BotStatus::Disconnected;
+                        } else {
+                            s.status = BotStatus::Connecting;
+                        }
                     }
                     self.emit(WsEvent::BotStatus {
                         bot_id: self.bot_id,
-                        status: "connecting".into(),
+                        status: if self.manual_disconnect {
+                            "disconnected".into()
+                        } else {
+                            "connecting".into()
+                        },
                     });
                     self.emit(WsEvent::BotWorld {
                         bot_id: self.bot_id,
                         world_name: String::new(),
                     });
-                    if let Some(r) = self.redirect.as_ref() {
+                    if self.manual_disconnect {
+                        self.reconnect_after = None;
+                        self.log_console(
+                            "[Bot] Manual disconnect — staying offline until reconnect"
+                                .to_string(),
+                        );
+                    } else if let Some(r) = self.redirect.as_ref() {
                         let addr: SocketAddr = format!("{}:{}", r.server, r.port)
                             .parse()
                             .expect("Invalid redirect address");
@@ -2053,7 +2077,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
 
         let facing_left = target_x < self.pos_x;
         self.pos_x = target_x;
-        self.pos_y = target_y;
+        self.pos_y = target_y + 2.0;
 
         {
             let mut s = self.state.write().unwrap();
@@ -2653,6 +2677,11 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             BotCommand::WalkTo { x, y } => {
                 self.find_path(x, y);
             }
+            BotCommand::MoveTo { x, y } => {
+                if x >= 0 && y >= 0 {
+                    self.walk(x as u32, y as u32);
+                }
+            }
             BotCommand::RunScript { content } => {
                 // Stop any currently running script first.
                 self.script_stop.store(true, Ordering::Relaxed);
@@ -2697,11 +2726,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 self.disconnect();
             }
             BotCommand::Reconnect => {
-                if self.peer_id.is_some() {
-                    self.disconnect();
-                } else {
-                    self.reconnect_main();
-                }
+                self.reconnect();
             }
             BotCommand::Place { x, y, item } => {
                 self.place(x, y, item, false);
@@ -2711,6 +2736,21 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             }
             BotCommand::Wrench { x, y } => {
                 self.wrench_at(x, y);
+            }
+            BotCommand::WrenchPlayer { net_id } => {
+                self.wrench_player(net_id);
+            }
+            BotCommand::Active { x, y } => {
+                self.active_tile(x, y);
+            }
+            BotCommand::Enter { pass } => {
+                if let Some(pw) = pass {
+                    self.send_text(&format!("action|input\n|text|{pw}\n"));
+                } else {
+                    let cx = (self.pos_x / 32.0) as i32;
+                    let cy = (self.pos_y / 32.0) as i32;
+                    self.active_tile(cx, cy);
+                }
             }
             BotCommand::Wear { item_id } => {
                 self.wear(item_id);
@@ -2724,6 +2764,15 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             BotCommand::Trash { item_id, count } => {
                 self.trash_item(item_id, count);
             }
+            BotCommand::FastDrop { item_id, count } => {
+                self.fast_drop(item_id, count);
+            }
+            BotCommand::FastTrash { item_id, count } => {
+                self.fast_trash(item_id, count);
+            }
+            BotCommand::Buy { pack_id } => {
+                self.buy(&pack_id);
+            }
             BotCommand::LeaveWorld => {
                 self.leave_world();
             }
@@ -2732,6 +2781,29 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             }
             BotCommand::FindPath { x, y } => {
                 self.find_path(x, y);
+            }
+            BotCommand::SetDirection { facing_left } => {
+                self.set_direction(facing_left);
+            }
+            BotCommand::CollectObject { oid, range } => {
+                self.collect_object_at(oid, range);
+            }
+            BotCommand::Collect { range, interval_ms } => {
+                self.collect(Some(range as u8), Some(interval_ms));
+            }
+            BotCommand::SendRaw { pkt } => {
+                self.send_game_packet(&pkt, true);
+            }
+            BotCommand::SendPacket { ptype, text } => {
+                match ptype {
+                    2 => self.send_text(&text),
+                    3 => self.send_game_message(&text),
+                    _ => {}
+                }
+            }
+            BotCommand::SetMac { mac } => {
+                self.mac = mac.clone();
+                self.state.write().unwrap().mac = mac;
             }
             BotCommand::SetDelays(d) => {
                 self.delays = d.clone();
@@ -2755,6 +2827,44 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 self.auto_reconnect = enabled;
                 self.state.write().unwrap().auto_reconnect = enabled;
             }
+            BotCommand::SetIgnoreGems { enabled } => {
+                self.ignore_gems = enabled;
+                self.state.write().unwrap().ignore_gems = enabled;
+            }
+            BotCommand::SetIgnoreEssences { enabled } => {
+                self.ignore_essences = enabled;
+                self.state.write().unwrap().ignore_essences = enabled;
+            }
+            BotCommand::SetAutoLeaveOnMod { enabled } => {
+                self.auto_leave_on_mod = enabled;
+                self.state.write().unwrap().auto_leave_on_mod = enabled;
+            }
+            BotCommand::SetAutoBan { enabled } => {
+                self.auto_ban = enabled;
+                self.state.write().unwrap().auto_ban = enabled;
+            }
+            BotCommand::SetCollectInterval { ms } => {
+                self.collect_interval = ms;
+            }
+            BotCommand::SetCollectRange { tiles } => {
+                self.collect_radius_tiles = tiles.clamp(1, 5);
+                self.state.write().unwrap().collect_radius_tiles = self.collect_radius_tiles;
+            }
+            BotCommand::SetCollectPathCheck { enabled } => {
+                self.collect_path_check = enabled;
+                self.state.write().unwrap().collect_path_check = enabled;
+            }
+            BotCommand::SetReconnectInterval { ms } => {
+                self.reconnect_interval = ms;
+            }
+            BotCommand::SetPlaceDelay { ms } => {
+                self.delays.place_ms = ms;
+                self.state.write().unwrap().delays.place_ms = ms;
+            }
+            BotCommand::SetWalkDelay { ms } => {
+                self.delays.walk_ms = ms;
+                self.state.write().unwrap().delays.walk_ms = ms;
+            }
             BotCommand::SetCollectConfig {
                 radius_tiles,
                 blacklist,
@@ -2771,14 +2881,59 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
 
     // ── Lua-callable helpers ────────────────────────────────────────────────────
 
+    /// User-requested disconnect: stays offline until `reconnect()`.
+    /// Cancels any pending auto-reconnect timer; the ENet `Disconnect`
+    /// event completes the transition to `Disconnected` status.
     pub fn disconnect(&mut self) {
+        self.manual_disconnect = true;
+        self.reconnect_after = None;
+        if let Some(id) = self.peer_id {
+            self.host.peer_disconnect(id, 0);
+        } else {
+            {
+                let mut s = self.state.write().unwrap();
+                s.status = BotStatus::Disconnected;
+                s.world_name = String::new();
+                s.players = Vec::new();
+                s.ping_ms = 0;
+            }
+            self.emit(WsEvent::BotStatus {
+                bot_id: self.bot_id,
+                status: "disconnected".into(),
+            });
+            self.emit(WsEvent::BotWorld {
+                bot_id: self.bot_id,
+                world_name: String::new(),
+            });
+            self.log_console("[Bot] Manual disconnect — staying offline until reconnect".to_string());
+        }
+    }
+
+    fn disconnect_raw(&mut self) {
         if let Some(id) = self.peer_id {
             self.host.peer_disconnect(id, 0);
         }
     }
 
+    /// User-requested reconnect: clears the manual-disconnect latch, then
+    /// reconnects immediately if offline or via the disconnect handler if online.
     pub fn reconnect(&mut self) {
-        self.reconnect_main();
+        self.manual_disconnect = false;
+        self.reconnect_after = None;
+        if self.peer_id.is_some() {
+            self.disconnect_raw();
+        } else {
+            {
+                let mut s = self.state.write().unwrap();
+                s.status = BotStatus::Connecting;
+            }
+            self.emit(WsEvent::BotStatus {
+                bot_id: self.bot_id,
+                status: "connecting".into(),
+            });
+            self.log_console("[Bot] Manual reconnect requested".to_string());
+            self.reconnect_main();
+        }
     }
 
     pub fn say(&mut self, text: &str) {
